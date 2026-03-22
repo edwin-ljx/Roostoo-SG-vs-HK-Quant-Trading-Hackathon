@@ -1,17 +1,22 @@
-# Roostoo Trading Bot
+# Roostoo Trading Bot v4  —  Regime-Adaptive
 
 ## Project Overview
 
-A fully autonomous crypto trading bot for the Roostoo Mock Exchange hackathon.
+A fully autonomous, market-regime-adaptive crypto trading bot for the Roostoo Mock Exchange.
 
-**Strategy:** Multi-Signal Momentum + Mean-Reversion Hybrid
-**Key features:**
-- EMA crossover trend filter blended with Rate-of-Change momentum
-- Fractional Kelly position sizing, volatility-adjusted per asset
-- Drawdown circuit breaker, concentration cap, minimum order guard
-- Binance historical OHLCV warm-up so indicators are ready from tick 1
-- Structured JSONL trade log (every field the judges expect)
-- Exponential backoff retry on every API call
+**Strategy:** Dual-mode regime-adaptive trading
+- **MOMENTUM mode** (bullish): trend following with RSI pullback entry
+- **REVERSION mode** (bearish): oversold bounce trades with quick exits
+
+**Core features:**
+- Auto-detects market regime from BTC EMA + breadth analysis
+- Regime-specific parameters for position sizing, stops, and exits
+- ATR-based dynamic stop-loss, take-profit, and trailing stops
+- Spread reversion guard (exits on extreme bid-ask spreads)
+- Kelly criterion position sizing adjusted for volatility
+- 15% drawdown circuit breaker with automatic order cancellation
+- Binance historical warm-up (60 × 1-min candles per pair)
+- Structured JSONL trade log with full execution details
 
 ---
 
@@ -19,14 +24,16 @@ A fully autonomous crypto trading bot for the Roostoo Mock Exchange hackathon.
 
 ```
 bot.py
-├── API Client         _request()  — signed/unsigned, exponential backoff
-├── Market Data        get_ticker_all(), fetch_binance_closes()
-├── Signal Engine      compute_signals()  — EMA crossover + ROC momentum
-├── Position Sizing    kelly_usd()        — fractional Kelly, vol-adjusted
-├── Risk Manager       circuit breaker, concentration cap, min-notional guard
-├── Execution          place_order(), cancel_all_orders()
-├── Performance        PerformanceTracker — Sharpe, Sortino, Calmar, DD
-└── Logger             _log_trade()  → logs/bot_trades.jsonl + logs/bot.log
+├── API Client           _request()  — signed/unsigned, exponential backoff
+├── Market Data          get_ticker_all(), fetch_binance_ohlcv()
+├── Regime Detector      detect_regime()      — BTC EMA + breadth analysis
+├── Signal Engine        compute_signals()    — EMA + ROC + RSI composite
+├── Position Sizing      kelly_position_size() — ATR-adjusted Kelly
+├── Risk Manager         circuit breaker, concentration cap, min-notional guard
+├── Execution            place_order(), cancel_all_orders()
+├── Exit Logic           ATR stops, trailing stops, spread guards
+├── Performance          PerformanceTracker — Sharpe, Sortino, Calmar, Drawdown
+└── Logger               _log_trade() → logs/bot_trades.jsonl + logs/bot.log
 ```
 
 **Tech stack:** Python 3.10+, `requests` only (zero extra dependencies)
@@ -35,33 +42,99 @@ bot.py
 
 ## Strategy Explanation
 
-### Entry conditions
-| Condition | Threshold |
-|---|---|
-| EMA fast (5 ticks) > EMA slow (20 ticks) | Bullish |
-| Composite score = `0.6 × EMA_signal + 0.4 × ROC_norm` | |
-| `abs(score) > 0.30` | Trade fires |
+### Regime Detection
 
-### Exit conditions
-- Opposite signal fires (score flips sign + exceeds threshold)
-- Drawdown circuit breaker halts all trading
+Every tick, the bot detects market regime from:
 
-### Position sizing
+1. **BTC Trend** (EMA crossover on BTC/USD)
+   - EMA(5) > EMA(20) → Bullish signal
+   - EMA(5) ≤ EMA(20) → Bearish signal
+
+2. **Market Breadth** (% of whitelist pairs in uptrend)
+   - If ≥40% of pairs have EMA(3) > EMA(10) → Bullish
+   - If <40% → Bearish
+
+**Regime Logic:**
+- **MOMENTUM mode:** BTC bullish OR breadth bullish
+- **REVERSION mode:** BTC bearish AND breadth bearish
+
+---
+
+### Entry Logic (Regime-Dependent)
+
+| Parameter | MOMENTUM | REVERSION |
+|---|---|---|
+| **RSI threshold** | RSI < 45 (pullback) | RSI < 25 (extreme oversold) |
+| **Signal threshold** | 0.35+ | 0.35+ |
+| **Max positions** | 3 | 2 (conservative) |
+| **Pair filter** | Not already held | Not already held |
+
+**Entry workflow:**
+1. Detect regime
+2. Compute EMA + ROC + RSI signals for available pairs
+3. Select highest-scoring pair above threshold
+4. Calculate ATR-adjusted position size via Kelly criterion
+5. Place market BUY order with entry price tracking
+
+---
+
+### Exit Logic (ATR-Based Dynamic Levels)
+
+For each open position, the bot continuously monitors four exit conditions:
+
+| Exit Type | Trigger | Formula |
+|---|---|---|
+| **Spread Reversion** | Bid-ask spread > 0.5% | Exits immediately |
+| **ATR Stop-Loss** | Price ≤ entry - SL_mult × ATR | High: 1.5× ATR, Low: 1.0× ATR |
+| **ATR Take-Profit** | Price ≥ entry + TP_mult × ATR | High: 3.0× ATR, Low: 1.5× ATR |
+| **Trailing Stop** | Price ≤ peak - Trail_mult × ATR | High: 0.5× ATR, Low: 0.3× ATR |
+
+**Regime-specific parameters:**
+
+| Parameter | MOMENTUM | REVERSION |
+|---|---|---|
+| SL multiple | 1.5× ATR | 1.0× ATR (tighter) |
+| TP multiple | 3.0× ATR | 1.5× ATR (quicker exit) |
+| Trail multiple | 0.5× ATR | 0.3× ATR (lock in faster) |
+
+---
+
+### Position Sizing
+
 ```
-f* = abs(score) / vol²       # raw Kelly fraction
-f  = min(f* × 0.25, 0.20)   # capped at 20% of portfolio
-notional = portfolio_value × f
+signal_strength = composite_score (EMA + ROC + RSI)
+atr_volatility = ATR(7)
+base_kelly = min(signal_strength / (atr_volatility²) × 0.25, 0.20)
+position_usd = portfolio_value × base_kelly
+position_qty = position_usd / current_price
 ```
 
-### Risk management
-1. **25% drawdown circuit breaker** — cancels all pending orders, skips new trades
-2. **20% max concentration** per coin
-3. **5% USD buffer** always kept in reserve
-4. **$15 minimum notional** — prevents fee-burning micro-trades
-5. **Market orders only** — guaranteed fills, no stale limit order buildup
+Adjustments:
+- Capped at **20% of portfolio** max per trade
+- Minimum **$5,000 notional** per trade
+- 5% USD buffer always reserved
 
-### Data warm-up
-On startup, the bot fetches 60 × 1-min Binance candles per pair (Roostoo prices mirror Binance per FAQ). This ensures all EMA and ROC indicators are fully primed before the first live trade.
+---
+
+### Risk Management
+
+1. **15% drawdown circuit breaker** — halts all new trades, cancels pending orders
+2. **Max 3 positions in MOMENTUM** / **2 positions in REVERSION**
+3. **Spread reversion guard** — exits if bid-ask spreads spike
+4. **ATR-based stops** — prevent runaway losses
+5. **Trailing stops** — lock in gains as price moves favorably
+
+---
+
+### Data Warm-Up
+
+On startup, the bot:
+1. Fetches 60 × 1-min Binance OHLCV candles per whitelisted pair
+2. Populates price history for all technical indicators
+3. Calculates initial EMA, RSI, ATR values
+4. Ensures indicators are fully primed before first live trade
+
+This prevents indicator "warmup bias" and ensures consistent signal quality from tick 1.
 
 ---
 
