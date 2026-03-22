@@ -12,6 +12,8 @@ A fully autonomous, market-regime-adaptive crypto trading bot for the Roostoo Mo
 - Auto-detects market regime from BTC EMA + breadth analysis
 - Regime-specific parameters for position sizing, stops, and exits
 - ATR-based dynamic stop-loss, take-profit, and trailing stops
+- **Volatility Gate** — skips trades in low-volatility periods (ATR < 0.3% of price)
+- **Minimum hold period** — enforces 5-tick minimum before any exit
 - Spread reversion guard (exits on extreme bid-ask spreads)
 - Kelly criterion position sizing adjusted for volatility
 - 15% drawdown circuit breaker with automatic order cancellation
@@ -123,6 +125,23 @@ Adjustments:
 3. **Spread reversion guard** — exits if bid-ask spreads spike
 4. **ATR-based stops** — prevent runaway losses
 5. **Trailing stops** — lock in gains as price moves favorably
+
+---
+
+### Volatility Gate
+
+The bot implements a **volatility gate** to avoid trading during low-liquidity periods:
+
+**Gate Logic:**
+- **ATR Threshold:** Skips trading if ATR < 0.3% of current price
+  - Rationale: In flat markets, ATR-based stops may exit too easily; avoid whipsaws
+  - Market must show sufficient intrabar movement to trade
+  
+- **Minimum Hold Period:** Once in a trade, holds for at least **5 ticks (~40 seconds)**
+  - Prevents rapid in-and-out exits due to brief volatility spikes
+  - Allows positions time to develop before exiting
+  
+**Benefit:** Reduces false signals and chop-induced losses in sideways markets
 
 ---
 
