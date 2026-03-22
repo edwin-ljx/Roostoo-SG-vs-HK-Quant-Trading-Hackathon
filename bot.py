@@ -32,6 +32,7 @@ MAX_OPEN_POSITIONS = 3
 MIN_TRADE_USD      = 5000.0
 MAX_DRAWDOWN_PCT   = 0.15
 MIN_PRICE          = 0.01
+FORCE_LIQUIDATE    = True     # Set to True to force exit all positions immediately
 
 # Shared indicator settings
 EMA_FAST           = 3
@@ -703,6 +704,22 @@ def main():
                 entry     = float(entry_prices.get(coin, cur_price))
 
                 if cur_price <= 0 or entry <= 0:
+                    continue
+
+                # ── FORCE LIQUIDATE MODE ──────────────────────────
+                if FORCE_LIQUIDATE:
+                    log.warning(
+                        f"FORCE LIQUIDATE: {coin} at ${cur_price:.4f}  "
+                        f"qty={qty:.6f}  entry=${entry:.4f}"
+                    )
+                    amt_prec = exchange_info.get(pair, {}).get("AmountPrecision", 6)
+                    sell_qty = round(qty, amt_prec)
+                    resp = place_order(pair, "SELL", sell_qty)
+                    if resp.get("Success"):
+                        entry_prices.pop(coin, None)
+                        trail_peaks.pop(coin, None)
+                        save_entry_prices(entry_prices)
+                        log.warning(f"FORCE LIQUIDATE completed: {sell_qty} {coin}")
                     continue
 
                 if coin not in trail_peaks or cur_price > trail_peaks[coin]:
