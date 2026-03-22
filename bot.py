@@ -41,18 +41,23 @@ RSI_PERIOD         = 14
 ATR_PERIOD         = 7
 SPREAD_REVERT_PCT  = 0.005
 
+# ── VOLATILITY GATE ───────────────────────────
+MIN_ATR_PCT        = 0.003    # ATR must be >= 0.3% of price to trade
+                               # below this = market too quiet, skip
+MIN_HOLD_TICKS     = 5        # hold at least 5 ticks (~40s) before any exit
+
 # ── MOMENTUM MODE (bullish market) ────────────
-MOM_SIGNAL_THRESHOLD = 0.35   # min composite score to enter
-MOM_RSI_BUY_MAX      = 45     # buy when RSI < 45 (slight pullback)
-MOM_ATR_SL_MULT      = 1.5    # stop-loss  = entry - 1.5 × ATR
-MOM_ATR_TP_MULT      = 3.0    # take-profit = entry + 3.0 × ATR
-MOM_TRAIL_MULT       = 0.5    # trailing stop = peak - 0.5 × ATR
+MOM_SIGNAL_THRESHOLD = 0.55   # was 0.35 — only strong signals
+MOM_RSI_BUY_MAX      = 40     # was 45 — stricter pullback
+MOM_ATR_SL_MULT      = 2.5    # was 1.5 — more room to breathe
+MOM_ATR_TP_MULT      = 5.0    # was 3.0 — let winners run
+MOM_TRAIL_MULT       = 1.5    # was 0.5 — don't trail too tight
 
 # ── REVERSION MODE (bearish market) ───────────
-REV_RSI_BUY_MAX      = 25     # only buy when extremely oversold
-REV_ATR_SL_MULT      = 1.0    # tighter stop — bearish = cut fast
-REV_ATR_TP_MULT      = 1.5    # smaller target — take profits quickly
-REV_TRAIL_MULT       = 0.3    # very tight trailing — lock in gains fast
+REV_RSI_BUY_MAX      = 20     # was 25 — only extreme oversold
+REV_ATR_SL_MULT      = 1.5    # was 1.0 — slightly more room
+REV_ATR_TP_MULT      = 2.5    # was 1.5 — bigger target
+REV_TRAIL_MULT       = 0.8    # was 0.3 — less aggressive trailing
 REV_MAX_POSITIONS    = 2      # more conservative in bear market
 
 # ── REGIME DETECTOR ───────────────────────────
@@ -536,6 +541,13 @@ def compute_signals(price_history: dict, hlc_history: dict,
         rsi_val = rsi(prices, RSI_PERIOD)
         atr_val = atr(hlc, ATR_PERIOD)
 
+        # ── VOLATILITY GATE ──────────────────────────
+        # Skip if market is too quiet — ATR too small relative to price
+        atr_pct = atr_val / cur_price if cur_price > 0 else 0
+        if atr_pct < MIN_ATR_PCT:
+            log.debug(f"  SKIP {pair}: ATR too low ({atr_pct:.4%} < {MIN_ATR_PCT:.4%})")
+            continue
+
         if regime == "MOMENTUM":
             # Trend must be up
             ema_fast   = ema(prices, EMA_FAST)
@@ -549,26 +561,25 @@ def compute_signals(price_history: dict, hlc_history: dict,
 
             roc      = rate_of_change(prices, MOMENTUM_WINDOW)
             roc_norm = math.copysign(min(abs(roc) * 100, 1.0), roc)
-            score    = 0.6 * 1.0 + 0.4 * roc_norm  # EMA signal is always 1 here
+            score    = 0.6 * 1.0 + 0.4 * roc_norm
 
             if score >= MOM_SIGNAL_THRESHOLD:
                 signals[pair] = (score, atr_val)
                 log.info(
                     f"  [MOM] {pair}: score={score:+.3f}  "
-                    f"RSI={rsi_val:.1f}  ATR={atr_val:.4f}"
+                    f"RSI={rsi_val:.1f}  ATR={atr_val:.4f}  ATR%={atr_pct:.3%}"
                 )
 
         elif regime == "REVERSION":
-            # Only buy when extremely oversold — RSI < 25
+            # Only buy when extremely oversold — RSI < 20
             if rsi_val >= REV_RSI_BUY_MAX:
                 continue
 
-            # Score based on how oversold — more oversold = stronger signal
             oversold_score = (REV_RSI_BUY_MAX - rsi_val) / REV_RSI_BUY_MAX
             signals[pair]  = (oversold_score, atr_val)
             log.info(
                 f"  [REV] {pair}: oversold_score={oversold_score:.3f}  "
-                f"RSI={rsi_val:.1f}  ATR={atr_val:.4f}"
+                f"RSI={rsi_val:.1f}  ATR={atr_val:.4f}  ATR%={atr_pct:.3%}"
             )
 
     return signals
@@ -613,6 +624,7 @@ def main():
     trail_peaks: dict[str, float] = {
         coin: float(entry_prices.get(coin, 0)) for coin in entry_prices
     }
+    entry_ticks: dict[str, int] = {coin: 0 for coin in entry_prices}
 
     tick = 0
 
@@ -706,6 +718,15 @@ def main():
 
                 spread_pct  = (ask - bid) / cur_price if cur_price > 0 and bid > 0 else 0
                 spread_exit = spread_pct > SPREAD_REVERT_PCT
+
+                # Minimum hold time — don't exit on noise right after entry
+                ticks_held  = tick - entry_ticks.get(coin, 0)
+                if ticks_held < MIN_HOLD_TICKS and not spread_exit:
+                    log.info(
+                        f"  HOLD {coin}: min hold not reached "
+                        f"({ticks_held}/{MIN_HOLD_TICKS} ticks)  pnl={pnl_pct:+.2%}"
+                    )
+                    continue
 
                 exit_reason = None
                 if spread_exit:
@@ -802,251 +823,7 @@ def main():
                 filled_price = float(d.get("FilledAverPrice") or cur_price)
                 entry_prices[coin] = filled_price
                 trail_peaks[coin]  = filled_price
-                save_entry_prices(entry_prices)
-                log.info(
-                    f"BUY OK — ID={d.get('OrderID')}  "
-                    f"FilledQty={d.get('FilledQuantity')}  "
-                    f"AvgPx={filled_price}  "
-                    f"Commission={d.get('CommissionChargeValue')}"
-                )
-            else:
-                log.warning(f"BUY FAILED: {resp.get('ErrMsg', 'unknown')}")
-
-        except KeyboardInterrupt:
-            log.info("Bot interrupted by user.")
-            break
-        except Exception as e:
-            log.exception(f"Unexpected error: {e}")
-
-        elapsed = time.time() - tick_start
-        time.sleep(max(0, LOOP_INTERVAL_SEC - elapsed))
-
-    log.info("Final performance summary:")
-    tracker.report()
-    log.info("Bot stopped.")
-
-    exchange_info   = get_exchange_info()
-    tradeable_pairs = [p for p, info in exchange_info.items() if info.get("CanTrade")]
-    whitelist_pairs = [p for p in tradeable_pairs if p in WHITELIST]
-    log.info(f"Whitelist pairs: {whitelist_pairs}")
-
-    # Price history: closes + HLC for ATR
-    price_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=PRICE_HISTORY_MAX))
-    hlc_history:   dict[str, deque] = defaultdict(lambda: deque(maxlen=PRICE_HISTORY_MAX))
-
-    # Warm up from Binance
-    log.info(f"Warming up from Binance ({WARMUP_CANDLES} x 1-min candles)...")
-    for pair in whitelist_pairs:
-        ohlcv = fetch_binance_ohlcv(pair, limit=WARMUP_CANDLES)
-        if ohlcv:
-            for h, l, c in ohlcv:
-                price_history[pair].append(c)
-                hlc_history[pair].append((h, l, c))
-            log.info(f"  {pair}: {len(ohlcv)} candles  last=${ohlcv[-1][2]:.4f}  "
-                     f"ATR={atr(list(hlc_history[pair]), ATR_PERIOD):.4f}")
-        else:
-            log.warning(f"  {pair}: no warm-up data")
-
-    init_wallet  = get_balance()
-    init_tickers = get_ticker_all()
-    init_val     = portfolio_value(init_wallet, init_tickers)
-    log.info(f"Initial portfolio value: ${init_val:,.2f}")
-
-    tracker      = PerformanceTracker(init_val)
-    entry_prices = load_entry_prices()
-
-    # Trailing stop peaks — {coin: highest_price_since_entry}
-    trail_peaks: dict[str, float] = {
-        coin: float(entry_prices.get(coin, 0))
-        for coin in entry_prices
-    }
-
-    tick = 0
-
-    while True:
-        tick_start = time.time()
-        try:
-            tick += 1
-            log.info(f"\n{'─'*50}\nTick {tick}")
-
-            # 1. Tickers
-            tickers = get_ticker_all()
-            if not tickers:
-                log.warning("No ticker data — skipping.")
-                time.sleep(LOOP_INTERVAL_SEC)
-                continue
-
-            for pair in whitelist_pairs:
-                if pair in tickers:
-                    d   = tickers[pair]
-                    c   = d["LastPrice"]
-                    bid = d.get("MaxBid", c)
-                    ask = d.get("MinAsk", c)
-                    mid = (bid + ask) / 2 if bid and ask else c
-                    price_history[pair].append(c)
-                    hlc_history[pair].append((ask, bid, c))  # approximate H/L/C
-
-            # 2. Balance
-            wallet = get_balance()
-            if not wallet:
-                log.warning("Could not fetch balance — skipping.")
-                time.sleep(LOOP_INTERVAL_SEC)
-                continue
-
-            usd_free = wallet.get("USD", {}).get("Free", 0)
-            port_val = portfolio_value(wallet, tickers)
-            tracker.update(port_val)
-            tracker.report()
-
-            # 3. Circuit breaker
-            if tracker.drawdown > MAX_DRAWDOWN_PCT:
-                log.warning(
-                    f"CIRCUIT BREAKER: drawdown {tracker.drawdown:.2%} > "
-                    f"{MAX_DRAWDOWN_PCT:.2%}. Cancelling all. Halting."
-                )
-                cancel_all_orders()
-                time.sleep(LOOP_INTERVAL_SEC)
-                continue
-
-            # 4. Open positions
-            open_positions = {
-                coin: bal.get("Free", 0)
-                for coin, bal in wallet.items()
-                if coin != "USD" and bal.get("Free", 0) > 0.000001
-            }
-            log.info(
-                f"Open positions ({len(open_positions)}/{MAX_OPEN_POSITIONS}): "
-                f"{list(open_positions.keys()) or 'none'}"
-            )
-
-            # ── 5. EXIT LOGIC ────────────────────────────────────
-            for coin, qty in list(open_positions.items()):
-                pair      = f"{coin}/USD"
-                ticker_d  = tickers.get(pair, {})
-                cur_price = ticker_d.get("LastPrice", 0)
-                bid       = ticker_d.get("MaxBid", cur_price)
-                ask       = ticker_d.get("MinAsk", cur_price)
-                entry     = float(entry_prices.get(coin, cur_price))
-
-                if cur_price <= 0 or entry <= 0:
-                    continue
-
-                # Update trailing peak
-                if coin not in trail_peaks or cur_price > trail_peaks[coin]:
-                    trail_peaks[coin] = cur_price
-
-                peak      = trail_peaks[coin]
-                atr_val   = atr(list(hlc_history[pair]), ATR_PERIOD)
-                pnl_pct   = (cur_price - entry) / entry
-
-                # Calculate dynamic levels
-                sl_price  = entry - ATR_SL_MULT * atr_val
-                tp_price  = entry + ATR_TP_MULT * atr_val
-                trail_sl  = peak  - TRAIL_MULT  * atr_val
-
-                # Spread reversion guard
-                spread_pct = (ask - bid) / cur_price if cur_price > 0 and bid > 0 else 0
-                spread_exit = spread_pct > SPREAD_REVERT_PCT
-
-                exit_reason = None
-
-                if spread_exit:
-                    exit_reason = f"spread_reversion ({spread_pct:.3%})"
-                elif cur_price <= sl_price:
-                    exit_reason = f"ATR_stop_loss ({pnl_pct:.2%})"
-                elif cur_price >= tp_price:
-                    exit_reason = f"ATR_take_profit ({pnl_pct:.2%})"
-                elif cur_price <= trail_sl and pnl_pct > 0:
-                    exit_reason = f"trailing_stop (peak=${peak:.4f} trail=${trail_sl:.4f})"
-
-                if exit_reason:
-                    log.info(
-                        f"EXIT {coin}: {exit_reason}  "
-                        f"entry=${entry:.4f}  now=${cur_price:.4f}  "
-                        f"SL=${sl_price:.4f}  TP=${tp_price:.4f}  "
-                        f"trail=${trail_sl:.4f}"
-                    )
-                    amt_prec = exchange_info.get(pair, {}).get("AmountPrecision", 6)
-                    sell_qty = round(qty, amt_prec)
-                    resp = place_order(pair, "SELL", sell_qty,
-                                      entry_price=entry)
-                    if resp.get("Success"):
-                        entry_prices.pop(coin, None)
-                        trail_peaks.pop(coin, None)
-                        save_entry_prices(entry_prices)
-                        log.info(f"EXIT filled: {sell_qty} {coin}")
-                    continue
-
-                log.info(
-                    f"  HOLD {coin}: pnl={pnl_pct:+.2%}  "
-                    f"SL=${sl_price:.4f}  TP=${tp_price:.4f}  "
-                    f"trail=${trail_sl:.4f}  ATR={atr_val:.4f}"
-                )
-
-            # ── 6. ENTRY LOGIC ───────────────────────────────────
-            if len(open_positions) >= MAX_OPEN_POSITIONS:
-                log.info(f"At max positions ({MAX_OPEN_POSITIONS}). No new buys.")
-                time.sleep(LOOP_INTERVAL_SEC)
-                continue
-
-            if usd_free < MIN_TRADE_USD:
-                log.info(f"Insufficient USD (${usd_free:.2f}). No new buys.")
-                time.sleep(LOOP_INTERVAL_SEC)
-                continue
-
-            # Compute signals only for whitelisted pairs not already held
-            signals = compute_signals(
-                price_history, hlc_history,
-                [p for p in whitelist_pairs if p.split("/")[0] not in open_positions],
-                tickers
-            )
-
-            if not signals:
-                log.info("No qualifying buy signals. Holding cash.")
-                time.sleep(LOOP_INTERVAL_SEC)
-                continue
-
-            # Pick highest scoring signal
-            best_pair  = max(signals, key=lambda p: signals[p][0])
-            best_score, best_atr = signals[best_pair]
-            coin       = best_pair.split("/")[0]
-            cur_price  = tickers.get(best_pair, {}).get("LastPrice", 0)
-
-            if cur_price <= 0:
-                log.warning(f"Invalid price for {best_pair} — skipping.")
-                time.sleep(LOOP_INTERVAL_SEC)
-                continue
-
-            # Kelly position sizing adjusted for ATR
-            trade_usd = kelly_position_size(best_score, best_atr, cur_price, port_val)
-            trade_usd = min(trade_usd, usd_free * 0.95)
-            quantity  = trade_usd / cur_price
-
-            if quantity * cur_price < MIN_TRADE_USD:
-                log.info(f"Position too small (${quantity*cur_price:.2f}). Skipping.")
-                time.sleep(LOOP_INTERVAL_SEC)
-                continue
-
-            amt_prec = exchange_info.get(best_pair, {}).get("AmountPrecision", 6)
-            quantity = round(quantity, amt_prec)
-
-            sl_price = cur_price - ATR_SL_MULT * best_atr
-            tp_price = cur_price + ATR_TP_MULT * best_atr
-
-            log.info(
-                f"-> BUY {quantity} {best_pair} @ MARKET  "
-                f"signal={best_score:+.3f}  ATR={best_atr:.4f}  "
-                f"notional=${quantity*cur_price:.2f}  "
-                f"SL=${sl_price:.4f}  TP=${tp_price:.4f}  "
-                f"position={trade_usd/port_val:.1%} of portfolio"
-            )
-
-            resp = place_order(best_pair, "BUY", quantity)
-            if resp.get("Success"):
-                d = resp.get("OrderDetail", {})
-                filled_price = float(d.get("FilledAverPrice") or cur_price)
-                entry_prices[coin] = filled_price
-                trail_peaks[coin]  = filled_price
+                entry_ticks[coin]  = tick
                 save_entry_prices(entry_prices)
                 log.info(
                     f"BUY OK — ID={d.get('OrderID')}  "
