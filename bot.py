@@ -19,6 +19,11 @@ Run:
 import os, time, hmac, hashlib, logging, json, math, requests
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -32,7 +37,7 @@ MAX_OPEN_POSITIONS = 3
 MIN_TRADE_USD      = 5000.0
 MAX_DRAWDOWN_PCT   = 0.15
 MIN_PRICE          = 0.01
-FORCE_LIQUIDATE    = True     # Set to True to force exit all positions immediately
+FORCE_LIQUIDATE    = False     # Set to True to force exit all positions immediately
 
 # Shared indicator settings
 EMA_FAST           = 3
