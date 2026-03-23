@@ -106,15 +106,29 @@ For each open position, the bot continuously monitors four exit conditions:
 ```
 signal_strength = composite_score (EMA + ROC + RSI)
 atr_volatility = ATR(7)
-base_kelly = min(signal_strength / (atr_volatility²) × 0.25, 0.20)
+
+# Subtract fee impact from edge
+net_edge = signal_strength - (round_trip_fee_pct × 10)
+if net_edge <= 0:
+    skip trade  # fees consume all profit
+
+raw_kelly = net_edge / atr_volatility
+base_kelly = raw_kelly × kelly_fraction (0.25)
 position_usd = portfolio_value × base_kelly
 position_qty = position_usd / current_price
 ```
 
-Adjustments:
+**Fee Awareness:**
+- **Taker Fee:** 0.012% per trade (Roostoo fee structure)
+- **Round-Trip Fee:** 0.024% for buy + sell combined
+- **Net Edge Filter:** Skips trades where fees exceed profit potential
+- **TP Requirement:** Take-profit must cover at least 5× round-trip fee cost
+
+**Position Adjustments:**
 - Capped at **20% of portfolio** max per trade
 - Minimum **$5,000 notional** per trade
 - 5% USD buffer always reserved
+- **Volatility-adjusted:** High ATR → smaller position, Low ATR → larger position
 
 ---
 
