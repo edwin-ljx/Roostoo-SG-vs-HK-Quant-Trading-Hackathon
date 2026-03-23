@@ -183,7 +183,8 @@ def get_balance() -> dict:
 
 
 def place_order(pair: str, side: str, quantity: float,
-                price: float = None, entry_price: float = None) -> dict:
+                price: float = None, entry_price: float = None,
+                reason: str = "") -> dict:
     payload = {
         "pair":     pair,
         "side":     side.upper(),
@@ -193,7 +194,7 @@ def place_order(pair: str, side: str, quantity: float,
     if price:
         payload["price"] = str(price)
     resp = _request("POST", "/v3/place_order", payload, signed=True)
-    _log_trade(pair, side, quantity, price, resp, entry_price=entry_price)
+    _log_trade(pair, side, quantity, price, resp, entry_price=entry_price, reason=reason)
     return resp or {}
 
 
