@@ -19,11 +19,6 @@ Run:
 import os, time, hmac, hashlib, logging, json, math, requests
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from dotenv import load_dotenv
-
-
-load_dotenv()
-
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -37,7 +32,6 @@ MAX_OPEN_POSITIONS = 3
 MIN_TRADE_USD      = 5000.0
 MAX_DRAWDOWN_PCT   = 0.15
 MIN_PRICE          = 0.01
-FORCE_LIQUIDATE    = False     # Set to True to force exit all positions immediately
 
 # Shared indicator settings
 EMA_FAST           = 3
@@ -48,29 +42,29 @@ ATR_PERIOD         = 7
 SPREAD_REVERT_PCT  = 0.005
 
 # ── VOLATILITY GATE ───────────────────────────
-MIN_ATR_PCT        = 0.003    # ATR must be >= 0.3% of price to trade
-                               # below this = market too quiet, skip
-MIN_HOLD_TICKS     = 5        # hold at least 5 ticks (~40s) before any exit
+MIN_ATR_PCT        = 0.001    # lowered from 0.003 — 0.1% minimum movement
+MIN_HOLD_TICKS     = 3        # lowered from 5 — 24s minimum hold
 
 # ── MOMENTUM MODE (bullish market) ────────────
-MOM_SIGNAL_THRESHOLD = 0.55   # was 0.35 — only strong signals
-MOM_RSI_BUY_MAX      = 40     # was 45 — stricter pullback
-MOM_ATR_SL_MULT      = 2.5    # was 1.5 — more room to breathe
-MOM_ATR_TP_MULT      = 5.0    # was 3.0 — let winners run
-MOM_TRAIL_MULT       = 1.5    # was 0.5 — don't trail too tight
+MOM_SIGNAL_THRESHOLD = 0.35   # lowered from 0.55 — easier to trigger
+MOM_RSI_BUY_MAX      = 55     # raised from 40 — more entries allowed
+MOM_ATR_SL_MULT      = 2.0    # stop-loss  = entry - 2.0 × ATR
+MOM_ATR_TP_MULT      = 4.0    # take-profit = entry + 4.0 × ATR
+MOM_TRAIL_MULT       = 1.0    # trailing stop = peak - 1.0 × ATR
 
 # ── REVERSION MODE (bearish market) ───────────
-REV_RSI_BUY_MAX      = 20     # was 25 — only extreme oversold
-REV_ATR_SL_MULT      = 1.5    # was 1.0 — slightly more room
-REV_ATR_TP_MULT      = 2.5    # was 1.5 — bigger target
-REV_TRAIL_MULT       = 0.8    # was 0.3 — less aggressive trailing
-REV_MAX_POSITIONS    = 2      # more conservative in bear market
+REV_RSI_STRONG       = 25     # raised from 20 — more opportunities
+REV_RSI_MEDIUM       = 35     # raised from 30
+REV_RSI_WEAK         = 45     # raised from 38 — catches more bounces
+REV_ATR_SL_MULT      = 1.0    # stop-loss
+REV_ATR_TP_MULT      = 1.5    # take-profit
+REV_TRAIL_MULT       = 0.5    # trailing stop
+REV_MAX_POSITIONS    = 2      # conservative in bear market
 
 # ── REGIME DETECTOR ───────────────────────────
-REGIME_EMA_FAST      = 5      # short EMA for regime detection on BTC
-REGIME_EMA_SLOW      = 20     # long  EMA for regime detection on BTC
-REGIME_BREADTH_MIN   = 0.40   # need >40% of pairs in uptrend for MOMENTUM
-                               # below this → REVERSION mode
+REGIME_EMA_FAST      = 5
+REGIME_EMA_SLOW      = 20
+REGIME_BREADTH_MIN   = 0.30   # lowered from 0.40 — 30% of pairs in uptrend = MOMENTUM
 
 # Kelly position sizing
 KELLY_FRACTION     = 0.25
@@ -87,7 +81,7 @@ WHITELIST = {
 }
 
 PRICE_HISTORY_MAX  = 300
-WARMUP_CANDLES     = 60
+WARMUP_CANDLES     = 100      # increased from 60 — better indicator warmup
 LOG_FILE           = "logs/bot_trades.jsonl"
 ENTRY_FILE         = "logs/entry_prices.json"
 RETRY_ATTEMPTS     = 3
@@ -577,15 +571,29 @@ def compute_signals(price_history: dict, hlc_history: dict,
                 )
 
         elif regime == "REVERSION":
-            # Only buy when extremely oversold — RSI < 20
-            if rsi_val >= REV_RSI_BUY_MAX:
+            prices_list = list(prices)
+            if len(prices_list) < 2:
                 continue
 
-            oversold_score = (REV_RSI_BUY_MAX - rsi_val) / REV_RSI_BUY_MAX
-            signals[pair]  = (oversold_score, atr_val)
+            rsi_val    = rsi(prices_list, RSI_PERIOD)
+            prev_price = prices_list[-2]
+            bouncing   = cur_price > prev_price  # price turned up — confirmation
+
+            # Tier the signal by RSI depth + bounce confirmation
+            if rsi_val < REV_RSI_STRONG and bouncing:
+                score = 1.0    # strongest — RSI < 20 and bouncing
+            elif rsi_val < REV_RSI_MEDIUM and bouncing:
+                score = 0.65   # medium — RSI < 30 and bouncing
+            elif rsi_val < REV_RSI_WEAK and bouncing:
+                score = 0.35   # weak — RSI < 38 and bouncing
+            else:
+                continue       # not oversold enough or not bouncing yet
+
+            signals[pair] = (score, atr_val)
             log.info(
-                f"  [REV] {pair}: oversold_score={oversold_score:.3f}  "
-                f"RSI={rsi_val:.1f}  ATR={atr_val:.4f}  ATR%={atr_pct:.3%}"
+                f"  [REV] {pair}: score={score:.2f}  "
+                f"RSI={rsi_val:.1f}  bouncing={bouncing}  "
+                f"ATR={atr_val:.4f}  ATR%={atr_pct:.3%}"
             )
 
     return signals
@@ -711,22 +719,6 @@ def main():
                 if cur_price <= 0 or entry <= 0:
                     continue
 
-                # ── FORCE LIQUIDATE MODE ──────────────────────────
-                if FORCE_LIQUIDATE:
-                    log.warning(
-                        f"FORCE LIQUIDATE: {coin} at ${cur_price:.4f}  "
-                        f"qty={qty:.6f}  entry=${entry:.4f}"
-                    )
-                    amt_prec = exchange_info.get(pair, {}).get("AmountPrecision", 6)
-                    sell_qty = round(qty, amt_prec)
-                    resp = place_order(pair, "SELL", sell_qty)
-                    if resp.get("Success"):
-                        entry_prices.pop(coin, None)
-                        trail_peaks.pop(coin, None)
-                        save_entry_prices(entry_prices)
-                        log.warning(f"FORCE LIQUIDATE completed: {sell_qty} {coin}")
-                    continue
-
                 if coin not in trail_peaks or cur_price > trail_peaks[coin]:
                     trail_peaks[coin] = cur_price
 
@@ -770,7 +762,7 @@ def main():
                     amt_prec = exchange_info.get(pair, {}).get("AmountPrecision", 6)
                     sell_qty = round(qty, amt_prec)
                     resp = place_order(pair, "SELL", sell_qty,
-                                      entry_price=entry)
+                                      entry_price=entry, reason=exit_reason)
                     if resp.get("Success"):
                         entry_prices.pop(coin, None)
                         trail_peaks.pop(coin, None)
@@ -802,6 +794,24 @@ def main():
             )
 
             if not signals:
+                # Debug — show why each pair was skipped
+                for pair in [p for p in whitelist_pairs if p.split("/")[0] not in open_positions]:
+                    prices_d = list(price_history.get(pair, []))
+                    hlc_d    = list(hlc_history.get(pair, []))
+                    if len(prices_d) < 2:
+                        continue
+                    cur_p   = tickers.get(pair, {}).get("LastPrice", 0)
+                    atr_v   = atr(hlc_d, ATR_PERIOD)
+                    atr_p   = atr_v / cur_p if cur_p > 0 else 0
+                    rsi_v   = rsi(prices_d, RSI_PERIOD)
+                    ema_f   = ema(prices_d, EMA_FAST)
+                    ema_s   = ema(prices_d, EMA_SLOW)
+                    bounce  = prices_d[-1] > prices_d[-2]
+                    log.info(
+                        f"  SKIP {pair}: RSI={rsi_v:.1f}  "
+                        f"ATR%={atr_p:.4%}  EMA_up={ema_f>ema_s}  "
+                        f"bouncing={bounce}  regime={regime}"
+                    )
                 log.info(f"No qualifying {regime} signals. Holding cash.")
                 time.sleep(LOOP_INTERVAL_SEC)
                 continue
