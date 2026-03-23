@@ -41,25 +41,30 @@ RSI_PERIOD         = 14
 ATR_PERIOD         = 7
 SPREAD_REVERT_PCT  = 0.005
 
+# ── COMMISSION ────────────────────────────────
+TAKER_FEE_PCT      = 0.00012   # 0.012% per trade (Roostoo taker fee)
+ROUND_TRIP_FEE_PCT = 0.00024   # 0.024% for buy + sell combined
+MIN_PROFIT_MULT    = 5.0        # TP must cover at least 5× round trip fee
+
 # ── VOLATILITY GATE ───────────────────────────
-MIN_ATR_PCT        = 0.001    # lowered from 0.003 — 0.1% minimum movement
-MIN_HOLD_TICKS     = 3        # lowered from 5 — 24s minimum hold
+MIN_ATR_PCT        = 0.001     # 0.1% minimum ATR/price to trade
+MIN_HOLD_TICKS     = 3         # hold at least 3 ticks (~24s) before exit
 
 # ── MOMENTUM MODE (bullish market) ────────────
-MOM_SIGNAL_THRESHOLD = 0.35   # lowered from 0.55 — easier to trigger
-MOM_RSI_BUY_MAX      = 55     # raised from 40 — more entries allowed
-MOM_ATR_SL_MULT      = 2.0    # stop-loss  = entry - 2.0 × ATR
-MOM_ATR_TP_MULT      = 4.0    # take-profit = entry + 4.0 × ATR
-MOM_TRAIL_MULT       = 1.0    # trailing stop = peak - 1.0 × ATR
+MOM_SIGNAL_THRESHOLD = 0.35
+MOM_RSI_BUY_MAX      = 55
+MOM_ATR_SL_MULT      = 3.0     # loose SL — room to breathe in uptrend
+MOM_ATR_TP_MULT      = 6.0     # TP = entry + 6.0×ATR (2:1 R:R after fees)
+MOM_TRAIL_MULT       = 1.5     # trail loosely — let winners run
 
 # ── REVERSION MODE (bearish market) ───────────
-REV_RSI_STRONG       = 25     # raised from 20 — more opportunities
-REV_RSI_MEDIUM       = 35     # raised from 30
-REV_RSI_WEAK         = 45     # raised from 38 — catches more bounces
-REV_ATR_SL_MULT      = 1.0    # stop-loss
-REV_ATR_TP_MULT      = 1.5    # take-profit
-REV_TRAIL_MULT       = 0.5    # trailing stop
-REV_MAX_POSITIONS    = 2      # conservative in bear market
+REV_RSI_STRONG       = 25
+REV_RSI_MEDIUM       = 35
+REV_RSI_WEAK         = 45
+REV_ATR_SL_MULT      = 1.0     # tight SL — bounce fails fast, exit quickly
+REV_ATR_TP_MULT      = 2.0     # TP = entry + 2.0×ATR
+REV_TRAIL_MULT       = 0.5     # tight trail — lock in gains fast
+REV_MAX_POSITIONS    = 2
 
 # ── REGIME DETECTOR ───────────────────────────
 REGIME_EMA_FAST      = 5
@@ -355,26 +360,27 @@ def atr(hlc_history: list, period: int = ATR_PERIOD) -> float:
 def kelly_position_size(score: float, atr_val: float,
                         price: float, port_val: float) -> float:
     """
-    Kelly fraction adjusted for ATR volatility.
-    - Higher ATR  → smaller position (more volatile = more risk)
-    - Lower ATR   → larger position (calm market = less risk)
+    Kelly fraction adjusted for ATR volatility and round-trip commission.
 
-    f = (edge / odds) × Kelly_fraction
-    edge  ≈ abs(score)
-    odds  ≈ ATR / price  (normalised volatility)
+    Net edge = signal score minus cost of fees (normalised)
+    If net edge <= 0, trade is not worth taking.
+
+    Higher ATR → smaller position (more volatile = more risk)
+    Lower ATR  → larger position (calm market = less risk)
     """
     if price <= 0 or atr_val <= 0:
         return port_val * MIN_POSITION_PCT
 
-    norm_vol = atr_val / price          # ATR as % of price
-    if norm_vol <= 0:
-        return port_val * MIN_POSITION_PCT
+    norm_vol = atr_val / price
 
-    raw_kelly = abs(score) / norm_vol   # Kelly fraction
+    # Subtract fee cost from edge — ensures trade is worth taking
+    net_edge = abs(score) - (ROUND_TRIP_FEE_PCT * 10)
+    if net_edge <= 0:
+        return 0.0   # fees eat the entire edge — skip
+
+    raw_kelly = net_edge / norm_vol
     fraction  = raw_kelly * KELLY_FRACTION
-
-    # Clamp between floor and ceiling
-    fraction = max(MIN_POSITION_PCT, min(fraction, MAX_POSITION_PCT))
+    fraction  = max(MIN_POSITION_PCT, min(fraction, MAX_POSITION_PCT))
     return port_val * fraction
 
 
@@ -542,10 +548,21 @@ def compute_signals(price_history: dict, hlc_history: dict,
         atr_val = atr(hlc, ATR_PERIOD)
 
         # ── VOLATILITY GATE ──────────────────────────
-        # Skip if market is too quiet — ATR too small relative to price
         atr_pct = atr_val / cur_price if cur_price > 0 else 0
         if atr_pct < MIN_ATR_PCT:
             log.debug(f"  SKIP {pair}: ATR too low ({atr_pct:.4%} < {MIN_ATR_PCT:.4%})")
+            continue
+
+        # ── FEE GATE ─────────────────────────────────
+        # Use the appropriate TP multiplier for current regime
+        tp_mult = MOM_ATR_TP_MULT if regime == "MOMENTUM" else REV_ATR_TP_MULT
+        expected_profit_pct = (tp_mult * atr_val) / cur_price
+        min_required        = ROUND_TRIP_FEE_PCT * MIN_PROFIT_MULT
+        if expected_profit_pct < min_required:
+            log.debug(
+                f"  SKIP {pair}: TP {expected_profit_pct:.4%} < "
+                f"min required {min_required:.4%} (fees)"
+            )
             continue
 
         if regime == "MOMENTUM":
@@ -762,7 +779,7 @@ def main():
                     amt_prec = exchange_info.get(pair, {}).get("AmountPrecision", 6)
                     sell_qty = round(qty, amt_prec)
                     resp = place_order(pair, "SELL", sell_qty,
-                                      entry_price=entry)
+                                      entry_price=entry, reason=exit_reason)
                     if resp.get("Success"):
                         entry_prices.pop(coin, None)
                         trail_peaks.pop(coin, None)
@@ -846,6 +863,7 @@ def main():
                 f"signal={best_score:+.3f}  ATR={best_atr:.4f}  "
                 f"notional=${quantity*cur_price:.2f}  "
                 f"SL=${sl_price:.4f}  TP=${tp_price:.4f}  "
+                f"fee_cost=${quantity*cur_price*ROUND_TRIP_FEE_PCT:.2f}  "
                 f"size={trade_usd/port_val:.1%} of portfolio"
             )
 
