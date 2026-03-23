@@ -762,7 +762,7 @@ def main():
                     amt_prec = exchange_info.get(pair, {}).get("AmountPrecision", 6)
                     sell_qty = round(qty, amt_prec)
                     resp = place_order(pair, "SELL", sell_qty,
-                                      entry_price=entry, reason=exit_reason)
+                                      entry_price=entry)
                     if resp.get("Success"):
                         entry_prices.pop(coin, None)
                         trail_peaks.pop(coin, None)
